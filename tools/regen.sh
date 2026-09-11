@@ -1,107 +1,89 @@
 #!/usr/bin/env bash
-# Regen pipeline driver for LegendofZeldaAlttpRecomp.
+# Regenerate src/gen/*.c for Legend of Zelda, The - A Link to the Past from a verified ROM.
 #
-# Regenerates src/gen/*.c from the recomp/bank_*.cfg configs over a verified
-# zelda.sfc, then syncs recomp/funcs.h. Modeled on MegamanXRecomp/tools/regen.sh
-# and SuperMarioWorldRecomp/tools/regen.sh.
+# Generated C is derived from copyrighted ROM data and is never committed;
+# every developer regenerates from their own copy. The ROM digests come from
+# rom_identity.txt, which the build and the release workflow read too, so
+# there is one place to change when a revision changes.
 #
 # Flags:
-#   --no-tests             skip the framework test suite (default: run it).
-#   --strict-idempotent    regenerate into a temporary directory and require
-#                          byte-identical output.
-#   -h | --help            this message.
-#
-# Run from anywhere — paths resolve relative to this script's location.
+#   --rom <path>  ROM to generate from. Defaults to a known filename at the
+#                 repo root, but the ROM does not have to live in the repo —
+#                 keeping it on your own drive is the better habit, and
+#                 SNESRECOMP_ROM sets it once for a shell.
+#   --no-verify   skip the ROM digest check (for a revision this project has
+#                 not been pinned to yet — expect the generated C to differ)
+#   --cfg-roots   seed analysis from every func declaration in recomp/*.cfg
+#   -h|--help     this message
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
 
-RUN_TESTS=1
-STRICT_IDEMPOTENT=0
-for arg in "$@"; do
-  case "$arg" in
-    --no-tests) RUN_TESTS=0 ;;
-    --strict-idempotent) STRICT_IDEMPOTENT=1 ;;
-    -h|--help)  sed -n '2,/^set -euo/p' "$0" | sed -n '/^# /p' | sed 's/^# //'; exit 0 ;;
-    *) echo "regen.sh: unknown flag: $arg (try --help)" >&2; exit 2 ;;
+VERIFY=1
+CFG_ROOTS=0
+ROM="${SNESRECOMP_ROM:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rom) ROM=$2; shift 2 ;;
+    --no-verify) VERIFY=0; shift ;;
+    --cfg-roots) CFG_ROOTS=1; shift ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -n '/^# /p' | sed 's/^# //'; exit 0 ;;
+    *) echo "regen.sh: unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
 
-cd "$ROOT"
-
-ROM="zelda.sfc"
 SNESRECOMP_ROOT="${SNESRECOMP_ROOT:-snesrecomp}"
-TESTS="$SNESRECOMP_ROOT/tests/run_tests.py"
+CLI="$SNESRECOMP_ROOT/snesrecomp_cli.py"
+if [ ! -f "$CLI" ]; then
+  echo "regen.sh: $CLI missing — run: git submodule update --init --recursive" >&2
+  exit 1
+fi
 
-# Python interpreter: prefer python3 (macOS / most Linux have no bare `python`).
 PYTHON="${PYTHON:-$(command -v python3 || command -v python || true)}"
 if [ -z "$PYTHON" ]; then
-  echo "regen.sh: no python3/python interpreter found on PATH" >&2
+  echo "regen.sh: no python3 on PATH" >&2
   exit 1
 fi
 
-if [ ! -f "$ROM" ]; then
-  echo "regen.sh: $ROM not found at repo root — drop a verified ALttP ROM there." >&2
+# The framework parses rom_identity.txt (the same parser CI uses), so this
+# script carries no copy of a digest to forget on a revision bump.
+IDENTITY="$SNESRECOMP_ROOT/tools/rom_identity.py"
+EXPECTED_CRC32="${SNESRECOMP_EXPECTED_CRC32:-$("$PYTHON" "$IDENTITY" "$ROOT/rom_identity.txt" --get expected_crc32)}"
+EXPECTED_SHA256="${SNESRECOMP_EXPECTED_SHA256:-$("$PYTHON" "$IDENTITY" "$ROOT/rom_identity.txt" --get expected_sha256)}"
+
+# --rom / SNESRECOMP_ROM win; otherwise look for a known name at the root.
+if [ -z "$ROM" ]; then
+  for cand in "Legend of Zelda, The - A Link to the Past (USA).sfc" "Legend of Zelda, The - A Link to the Past (USA).sfc" "Legend of Zelda, The - A Link to the Past (USA).smc"; do
+    if [ -f "$cand" ]; then ROM="$cand"; break; fi
+  done
+fi
+if [ -z "$ROM" ] || [ ! -f "$ROM" ]; then
+  echo "regen.sh: no ROM found." >&2
+  echo "          Pass --rom /path/to/Legend of Zelda, The - A Link to the Past (USA).sfc, set SNESRECOMP_ROM, or put" >&2
+  echo "          it at the repo root. You must legally own a copy of" >&2
+  echo "          Legend of Zelda, The - A Link to the Past." >&2
   exit 1
 fi
 
-step() { echo; echo "=== $* ==="; }
-
-ANALYSIS_BACKEND="${SNESRECOMP_ANALYSIS_BACKEND:-native}"
-case "$ANALYSIS_BACKEND" in
-  native|python|auto) ;;
-  *) echo "regen.sh: invalid SNESRECOMP_ANALYSIS_BACKEND: $ANALYSIS_BACKEND" >&2; exit 2 ;;
-esac
-
-if [ "$ANALYSIS_BACKEND" = native ]; then
-  step "Building native analyzer"
-  "$PYTHON" "$SNESRECOMP_ROOT/tools/build_native_analyzer.py"
+VERIFY_ARGS=()
+if [ "$VERIFY" -eq 1 ]; then
+  VERIFY_ARGS=(--expected-crc32 "$EXPECTED_CRC32" --expected-sha256 "$EXPECTED_SHA256")
+  echo "== Verifying $ROM =="
+  "$PYTHON" "$CLI" verify-rom --rom "$ROM" "${VERIFY_ARGS[@]}"
+else
+  echo "== Skipping ROM verification (--no-verify) =="
 fi
 
-GEN_ROM="$ROM"
+GEN_ARGS=(--rom "$ROM" --cfg-dir recomp --out-dir src/gen
+          --funcs-h recomp/funcs.h --project-root "$ROOT")
+if [ "$CFG_ROOTS" -eq 1 ]; then GEN_ARGS+=(--cfg-roots); fi
+if [ "$VERIFY" -eq 1 ]; then GEN_ARGS+=("${VERIFY_ARGS[@]}"); fi
 
-# MSU-1 is implemented as a trusted Mods plugin. The IPS in recomp/msu1 is
-# retained only as credited reference material; regen always uses the stock ROM.
+echo "== Generating src/gen =="
+"$PYTHON" "$CLI" generate "${GEN_ARGS[@]}"
 
-step "Regenerating banks"
-# The LLE-first emitter publishes a complete staging directory atomically. It
-# also removes legacy title-prefixed units from staging before publication, so
-# a failed regeneration cannot leave the live output half-updated.
-# --cfg-roots is the static-coverage policy (mirrors MegamanX/SMW): every
-# declared `func` seeds the analysis closure so the proven surface is
-# materialized as AOT; the interpreter is a failsafe for the unprovable
-# remainder, never the plan of record for known code. Verified 2026-07-20:
-# 4597 AOT variants, clean attract, 0 unresolved / dispatch misses, no crash.
-# The historical "AOT promotion crashes Zelda" was resolved by PR #6's decoder
-# rewrite.
-"$PYTHON" "$SNESRECOMP_ROOT/tools/v2_emit.py" --rom "$GEN_ROM" \
-    --cfg-dir recomp --out-dir src/gen --cfg-roots \
-    --analysis-backend "$ANALYSIS_BACKEND"
-
-# Generated game code performs the stock 256-wide sprite draw cull. Expand its
-# horizontal comparison to the adaptive viewport after every regeneration.
-"$PYTHON" tools/apply_widescreen_overrides.py --gen-dir src/gen
-
-step "Syncing funcs.h"
-"$PYTHON" "$SNESRECOMP_ROOT/tools/v2_sync_funcs_h.py" --cfg-dir recomp \
-    --out recomp/funcs.h
-
-if [ "$STRICT_IDEMPOTENT" -eq 1 ]; then
-  step "Idempotency check: regen into temp dir + byte-compare"
-  TMP_GEN="$(mktemp -d)"
-  trap 'rm -rf "$TMP_GEN"' EXIT
-  "$PYTHON" "$SNESRECOMP_ROOT/tools/v2_emit.py" --rom "$GEN_ROM" \
-      --cfg-dir recomp --out-dir "$TMP_GEN" --cfg-roots \
-      --analysis-backend "$ANALYSIS_BACKEND"
-  "$PYTHON" tools/apply_widescreen_overrides.py --gen-dir "$TMP_GEN"
-  "$PYTHON" "$SNESRECOMP_ROOT/tools/v2_compare_output.py" \
-      --expected src/gen --actual "$TMP_GEN"
-fi
-
-if [ "$RUN_TESTS" -eq 1 ]; then
-  step "Framework tests"
-  "$PYTHON" "$TESTS"
-fi
-
-step "Done"
+echo
+echo "Done. Build with:"
+echo "  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"

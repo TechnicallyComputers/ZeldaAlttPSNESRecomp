@@ -1,0 +1,20 @@
+# ROM identity for Legend of Zelda, The - A Link to the Past — the single source of truth.
+#
+# Read by three consumers, so a revision change is made once, here:
+#   - the build   (CMake generates snesrecomp_rom_identity.h from this file)
+#   - tools/regen.sh
+#   - .github/workflows/release.yml
+#
+# Format is `key = value`, one per line; `#` starts a comment. Values may be
+# quoted. Leaving a digest empty means the build cannot verify a ROM it is
+# handed — it will say so rather than accept it.
+
+display_name    = Legend of Zelda, The - A Link to the Past
+rom_file        = Legend of Zelda, The - A Link to the Past (USA).sfc
+expected_crc32  = 777aac2f
+expected_sha256 = 66871d66be19ad2c34c927d6b14cd8eb6fc3181965b6e517cb361f7316009cfb
+mapping         = lorom
+region          = USA
+# What a mod package's [[target]] game_id must name to apply to this title
+# (snesrecomp/docs/MOD_PACKAGES.md). Stable across revisions on purpose.
+game_id         = zelda-alttp-us

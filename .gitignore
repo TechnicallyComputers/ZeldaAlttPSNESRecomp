@@ -76,3 +76,16 @@ _*
 ZeldaAlttPSNESRecomp-windows-*.zip
 zelda-v*.zip
 release-stage/
+
+# --- SNES recomp (Studio) ---
+/src/gen/
+/recomp/funcs.h
+/build/
+/build-*/
+/dist/
+/saves/
+/rom.cfg
+/keybinds.ini
+/config.ini
+/input.ini
+/analysis/
