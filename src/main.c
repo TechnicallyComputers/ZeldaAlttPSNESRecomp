@@ -58,7 +58,7 @@
 #include "snes_osd.h"             /* FPS readout, turbo flag, slot toasts */
 #include "snes_savestate_menu.h"  /* Select+R slot browser */
 #include "snes_rewind.h"          /* rewind ring + filmstrip */
-#include "zelda_overlay.h"        /* compositing them onto the frame */
+#include "snes_overlay_draw.h"    /* snes_ovl_* panel blit / upscale */
 #include "host_report.h"
 #include "widescreen.h"  // g_ws_active, g_ws_extra, RtlWidescreenPresent
 #include "snes/color_lut.h"  // opt-in present-time CRT color LUT (SNESRECOMP_SCREEN)
@@ -145,6 +145,10 @@ static SDL_Window *g_window;
 static uint8 g_paused, g_turbo, g_cursor = true;
 static uint8 g_current_window_scale;
 static uint32 g_input_state;
+/* Set by the [KeyMap] hotkeys (or the F7/F8 fallbacks) and consumed once by
+ * the main loop. */
+static int g_savestate_menu_hotkey;
+static int g_rewind_hotkey;
 /* Gamepad-driven SNES controller bits, kept separate from g_input_state
  * (keyboard) so the per-frame keybinds.ini polling at the top of the
  * main loop doesn't clear bits the gamepad just set. OR'd into `inputs`
@@ -174,7 +178,23 @@ static int g_script_index;    // current entry
 static int g_script_phase;    // 0=holding, 1=waiting
 static int g_script_counter;  // frames left in current phase
 
+/* One button, or several joined with '+' ("select+r").
+ *
+ * The gestures the host overlays answer to are chords -- Select+R opens the
+ * save-state browser -- and a script that can only hold one button at a time
+ * cannot reach them, which left those screens unreachable headlessly. Same
+ * capability GundamWing gets from SNESRECOMP_INPUT_SCRIPT; this host already
+ * had a script, so it grew the chord instead of a second mechanism. */
 static uint32 ParseButtonMask(const char *name) {
+  const char *plus = strchr(name, '+');
+  if (plus) {
+    char head[64];
+    size_t n = (size_t)(plus - name);
+    if (n >= sizeof(head)) n = sizeof(head) - 1;
+    memcpy(head, name, n);
+    head[n] = '\0';
+    return ParseButtonMask(head) | ParseButtonMask(plus + 1);
+  }
   if (strcmp(name, "start")  == 0) return 0x0008;
   if (strcmp(name, "select") == 0) return 0x0004;
   if (strcmp(name, "up")     == 0) return 0x0010;
@@ -411,23 +431,109 @@ void ZeldaPresentPixels(uint8 *pixel_buffer, size_t pitch) {
   }
 }
 
-/* Re-present the frame the player is already looking at, with the overlays
- * composited on top and WITHOUT touching the guest.
+/* The last frame the player saw, kept so an overlay pump has a backdrop.
  *
- * This is what a modal pump calls. The first version called
- * DrawPpuFrameWithPerf(), which re-entered ZeldaDrawPpuFrame() ~125 times a
- * second: DMA, HDMA per scanline, and I_IRQ(&g_cpu) into the guest's own
- * interrupt handler, all while RtlRunFrame was never called. The machine was
- * being driven with no frame ever completing, which wedged it -- and it also
- * meant a state saved from the menu was not the frame on screen, which is the
- * whole premise of "save right here". */
-static void PresentHeldFrame(void) {
+ * It has to be a COPY. The backdrop cannot come from another call to the
+ * game's draw_ppu_frame: ZeldaDrawPpuFrame runs DMA, HDMA per scanline and
+ * I_IRQ(&g_cpu) per raster split -- it executes guest code -- so driving it
+ * from a modal loop pushes an interrupt frame every few milliseconds into a
+ * guest that is not running. That is what locked the game up when the
+ * save-state browser was opened. SuperMetroidRecomp hit the same thing and
+ * its src/main.c carries the same note. */
+/* The OSD status line and toasts, top-left at frame scale.
+ *
+ * Deliberately not snes_osd_draw_sdl(), which draws at {8,8} in window pixels:
+ * the OpenGL backend has no SDL_Renderer at all, and the SDL one gives its
+ * renderer a 256x224 logical size that would clip the OSD's 1032-pixel canvas
+ * to the left third. Blitting into the frame is the one placement both
+ * backends render identically. Halved, because the OSD is authored at
+ * OSD_SCALE 2 for a window-pixel draw. */
+static void ZeldaCompositeOsd(uint8 *frame, int pitch, int frame_w, int frame_h) {
+  const uint32_t *px;
+  int w, h;
+  if (!frame || !snes_osd_image(&px, &w, &h) || !px || w <= 0 || h <= 0)
+    return;
+  snes_ovl_blit_panel_rect(frame, pitch, frame_w, frame_h, px, w, h,
+                           2, 2, w / 2, h / 2);
+  snes_osd_present_done();
+}
+
+static uint8_t g_frozen_frame[kPpuBufWidth * 4 * 240];
+static int g_frozen_w, g_frozen_h;
+
+/* Present a frozen frame with whichever overlay is up.
+ *
+ * Presents at the PANEL's resolution, not the game's. The panels are authored
+ * at 512x448, twice the SNES field; compositing them into a 256-wide game
+ * buffer halves them and makes the text visibly coarser than the same overlay
+ * in other ports. So the frozen field is upscaled to the panel's size and the
+ * panel lands on it at 1:1.
+ *
+ * Placement is per-overlay, because the two modules draw for different
+ * shapes: the save-state browser is an opaque panel over the whole game rect,
+ * while the rewind filmstrip belongs across the bottom third, annotating the
+ * moment it describes. Centring both would put the filmstrip across the
+ * middle of the screen. */
+static void PresentFrozenWithOverlay(void) {
+  const uint32_t *panel = NULL;
+  int pw = 0, ph = 0;
+  int is_menu = snes_savestate_menu_overlay_image(&panel, &pw, &ph) && panel;
+  if (!is_menu && !(snes_rewind_overlay_image(&panel, &pw, &ph) && panel))
+    panel = NULL;
+
+  const int draw_w = (panel && pw > 0) ? pw : g_snes_width;
+  const int draw_h = (panel && ph > 0) ? ph : g_snes_height;
   uint8 *pixel_buffer = 0;
   int pitch = 0;
 
-  g_renderer_funcs.BeginDraw(g_snes_width, g_snes_height, &pixel_buffer, &pitch);
-  ZeldaPresentPixels(pixel_buffer, (size_t)pitch);
-  ZeldaCompositeOsd(pixel_buffer, pitch, g_snes_width, g_snes_height);
+  g_renderer_funcs.BeginDraw(draw_w, draw_h, &pixel_buffer, &pitch);
+  if (!pixel_buffer)
+    return;                     /* lock failed; nothing safe to write */
+
+  if (g_frozen_w > 0 && g_frozen_h > 0)
+    snes_ovl_upscale_frame(pixel_buffer, pitch, draw_w, draw_h,
+                           (const uint32_t *)g_frozen_frame,
+                           g_frozen_w * 4, g_frozen_w, g_frozen_h);
+  else
+    memset(pixel_buffer, 0, (size_t)draw_h * (size_t)pitch);
+
+  if (panel) {
+    if (is_menu) {
+      snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
+                               panel, pw, ph, 0, 0, draw_w, draw_h);
+    } else {
+      const int strip_h = draw_h / 3;
+      snes_ovl_blit_panel_rect(pixel_buffer, pitch, draw_w, draw_h,
+                               panel, pw, ph,
+                               0, draw_h - strip_h, draw_w, strip_h);
+    }
+  }
+  ZeldaCompositeOsd(pixel_buffer, pitch, draw_w, draw_h);
+  /* ZELDA_OVERLAY_DUMP=<path>: write the composited overlay frame as a PPM.
+   * The overlays can only be driven by a human, so this is the only way to
+   * check that a panel actually reaches the screen rather than inferring it
+   * from the module reporting itself open. */
+  {
+    const char *dump = getenv("ZELDA_OVERLAY_DUMP");
+    static int dumped = 0;
+    if (dump && !dumped && panel) {
+      FILE *f = fopen(dump, "wb");
+      if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", draw_w, draw_h);
+        for (int y = 0; y < draw_h; y++) {
+          const uint32_t *row = (const uint32_t *)(pixel_buffer + (size_t)y * (size_t)pitch);
+          for (int x = 0; x < draw_w; x++) {
+            uint32_t px = row[x];
+            fputc((px >> 16) & 0xFF, f); fputc((px >> 8) & 0xFF, f); fputc(px & 0xFF, f);
+          }
+        }
+        fclose(f);
+        dumped = 1;
+        fprintf(stderr, "[overlay_dump] wrote %s (%dx%d, %s)\n", dump, draw_w, draw_h,
+                is_menu ? "save-state browser" : "rewind filmstrip");
+      }
+    }
+  }
   g_renderer_funcs.EndDraw();
 }
 
@@ -460,6 +566,21 @@ static void DrawPpuFrameWithPerf(void) {
    * about. Both overlays composite over the same buffer either backend
    * presents. */
   ZeldaCompositeOsd(pixel_buffer, pitch, g_snes_width, g_snes_height);
+
+  /* Keep this frame: an overlay pump presents it as its backdrop, and it
+   * cannot ask the guest to draw another one. */
+  {
+    const int rows = g_snes_height * render_scale;
+    const int row_bytes = g_snes_width * render_scale * 4;
+    if (rows > 0 && row_bytes > 0 &&
+        (size_t)rows * (size_t)row_bytes <= sizeof(g_frozen_frame)) {
+      for (int y = 0; y < rows; y++)
+        memcpy(g_frozen_frame + (size_t)y * (size_t)row_bytes,
+               pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
+      g_frozen_w = g_snes_width * render_scale;
+      g_frozen_h = rows;
+    }
+  }
 
   g_renderer_funcs.EndDraw();
 }
@@ -505,7 +626,7 @@ static void RunSaveStateMenuModal(bool *running)
             }
         }
         snes_savestate_menu_poll_nav(CurrentPadWord(), (uint32_t)SDL_GetTicks());
-        PresentHeldFrame();
+        PresentFrozenWithOverlay();
         SDL_Delay(8);
     }
 }
@@ -535,12 +656,12 @@ static void RunRewindModal(bool *running)
             uint32 now = CurrentPadWord();
             uint32 pressed = now & ~prev;
             prev = now;
-            if (pressed & (1u << 6)) snes_rewind_step(-1);  /* Left  */
-            if (pressed & (1u << 7)) snes_rewind_step(+1);  /* Right */
-            if (pressed & (1u << 8)) snes_rewind_commit();  /* A     */
-            if (pressed & (1u << 0)) snes_rewind_close();   /* B     */
+            if (pressed & SNES_PAD_LEFT)  snes_rewind_step(-1);
+            if (pressed & SNES_PAD_RIGHT) snes_rewind_step(+1);
+            if (pressed & SNES_PAD_A)     snes_rewind_commit();
+            if (pressed & SNES_PAD_B)     snes_rewind_close();
         }
-        PresentHeldFrame();
+        PresentFrozenWithOverlay();
         SDL_Delay(8);
     }
 }
@@ -636,8 +757,6 @@ static SDL_Renderer *g_renderer;
 static SDL_Texture *g_texture;
 static SDL_Rect g_sdl_renderer_rect;
 
-static void SdlRenderer_DrawOverlay(const uint32_t *px, int w, int h);
-
 static bool SdlRenderer_Init(SDL_Window *window) {
   if (g_config.shader)
     fprintf(stderr, "Warning: Shaders are supported only with the OpenGL backend\n");
@@ -658,7 +777,6 @@ static bool SdlRenderer_Init(SDL_Window *window) {
            snesrecomp_sdl_get_render_vsync(renderer));
   }
   g_renderer = renderer;
-  g_zelda_overlay_draw = SdlRenderer_DrawOverlay;
   if (!g_config.ignore_aspect_ratio)
     snesrecomp_sdl_set_render_logical_size(renderer, g_snes_width, g_snes_height);
 
@@ -692,6 +810,21 @@ static void SdlRenderer_GetOutputSize(int *width, int *height) {
 }
 
 static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pitch) {
+  /* Follow the requested size. The overlay pump presents at the PANEL's
+   * resolution (512x448) rather than the game's, so that the panel keeps its
+   * authored detail; locking a rect bigger than the texture just fails, and
+   * the caller would get a NULL buffer. SDL_QueryTexture is gone in SDL3; the
+   * shim reads w/h either way. */
+  int texture_width = 0, texture_height = 0;
+  snesrecomp_sdl_get_texture_size(g_texture, &texture_width, &texture_height);
+  if (texture_width != width || texture_height != height) {
+    SDL_DestroyTexture(g_texture);
+    g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                  SDL_TEXTUREACCESS_STREAMING, width, height);
+    if (!g_texture)
+      Die("SDL texture allocation failed");
+    snesrecomp_sdl_set_texture_opaque(g_texture);
+  }
   g_sdl_renderer_rect.w = width;
   g_sdl_renderer_rect.h = height;
   if (!snesrecomp_sdl_lock_texture(g_texture, &g_sdl_renderer_rect,
@@ -699,32 +832,6 @@ static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pi
     printf("Failed to lock texture: %s\n", SDL_GetError());
     return;
   }
-}
-
-/* The panel at its authored resolution, over the same destination rect as the
- * game texture -- dst NULL, exactly as the game texture is rendered below, so
- * the panel lands on the frame it annotates however the window is scaled. */
-static SDL_Texture *g_overlay_texture;
-static int g_overlay_tw, g_overlay_th;
-
-static void SdlRenderer_DrawOverlay(const uint32_t *px, int w, int h) {
-  if (!g_renderer || !px || w <= 0 || h <= 0)
-    return;
-  if (!g_overlay_texture || g_overlay_tw != w || g_overlay_th != h) {
-    if (g_overlay_texture)
-      SDL_DestroyTexture(g_overlay_texture);
-    g_overlay_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
-                                          SDL_TEXTUREACCESS_STREAMING, w, h);
-    if (!g_overlay_texture)
-      return;
-    g_overlay_tw = w;
-    g_overlay_th = h;
-    /* The panel is opaque today; blending is what keeps a future translucent
-     * one from landing as a black box. */
-    SDL_SetTextureBlendMode(g_overlay_texture, SDL_BLENDMODE_BLEND);
-  }
-  SDL_UpdateTexture(g_overlay_texture, NULL, px, w * 4);
-  snesrecomp_sdl_render_texture(g_renderer, g_overlay_texture, NULL, NULL);
 }
 
 static void SdlRenderer_EndDraw(void) {
@@ -736,7 +843,6 @@ static void SdlRenderer_EndDraw(void) {
   SDL_RenderClear(g_renderer);
   /* SDL3's SDL_RenderTexture takes SDL_FRect, not SDL_Rect. */
   snesrecomp_sdl_render_texture(g_renderer, g_texture, &g_sdl_renderer_rect, NULL);
-  ZeldaDrawHostPanels();
   SDL_RenderPresent(g_renderer); // vsyncs to 60 FPS?
 }
 
@@ -1734,6 +1840,19 @@ error_reading:;
         break;
       case SDL_KEYDOWN:
         HandleInput(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event), true);
+        /* F7 opens the save-state browser and F8 the rewind filmstrip, unless
+         * the player has bound SaveStateMenu / Rewind elsewhere -- in which
+         * case their binding is the only one that works and this does not
+         * fight it. The framework ships both UNBOUND on purpose (F7 and F8
+         * are LoadState slots 7 and 8 in [KeyMap]), which leaves the two
+         * overlays with no key at all on a stock config; the pad gesture
+         * Select+R covers the browser, and nothing covered rewind. */
+        if (SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_F7 &&
+            FindCmdForSdlKey(SDLK_F7, (SDL_Keymod)0) != kKeys_SaveStateMenu)
+          g_savestate_menu_hotkey = 1;
+        if (SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_F8 &&
+            FindCmdForSdlKey(SDLK_F8, (SDL_Keymod)0) != kKeys_Rewind)
+          g_rewind_hotkey = 1;
         break;
       case SDL_KEYUP:
         HandleInput(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event), false);
@@ -1799,17 +1918,30 @@ error_reading:;
      * the press that closed the menu neither reaches the game nor re-opens
      * it. Must run on the same word RtlRunFrame gets. */
     inputs = snes_savestate_menu_filter_guest_input(inputs);
-    /* Select+R opens the slot browser. Edge-detected inside; safe every
-     * frame. The [KeyMap] SaveStateMenu hotkey is the other way in and is
-     * handled in HandleCommand. */
+
+    if (g_rewind_hotkey && !snes_rewind_is_open() &&
+        !snes_savestate_menu_is_open()) {
+      /* Refused during netplay by snes_rewind_open() itself: one machine
+       * cannot move its own clock backwards while a peer is watching. */
+      if (snes_rewind_open()) {
+        RunRewindModal(&running);
+        g_rewind_hotkey = 0;
+        continue;             /* guest was frozen: no frame to run or present */
+      }
+    }
+    g_rewind_hotkey = 0;
+    /* Exactly ONE poll_open per frame: it latches the previous word to edge
+     * detect against, so a second call in the same frame eats the edge.
+     * Select+R is the gesture; the hotkey below synthesises it. */
     (void)snes_savestate_menu_poll_open(inputs);
+    if (g_savestate_menu_hotkey) {
+      g_savestate_menu_hotkey = 0;
+      if (!snes_savestate_menu_is_open())
+        (void)snes_savestate_menu_poll_open(SNES_PAD_SELECT | SNES_PAD_R);
+    }
     if (snes_savestate_menu_is_open()) {
       RunSaveStateMenuModal(&running);
       continue;               /* the guest is frozen while a menu is open */
-    }
-    if (snes_rewind_is_open()) {
-      RunRewindModal(&running);
-      continue;
     }
 
     RtlRunFrame(inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
@@ -2006,17 +2138,12 @@ static void HandleCommand(uint32 j, bool pressed) {
       g_display_perf ^= 1;          /* title-bar draw-time readout */
       snes_osd_toggle_fps();        /* in-frame emulated-FPS readout */
       break;
-    case kKeys_SaveStateMenu:
-      /* The other way in; Select+R is polled on the input word each frame.
-       * Unbound by default in the framework's table because F7 -- what
-       * recomp-ui offers -- is LoadState slot 7 on SNES. Bind it in
-       * config.ini [KeyMap] if you want a key as well as the gesture. */
-      (void)snes_savestate_menu_poll_open(0xffffffffu);
-      break;
-    case kKeys_Rewind:
-      if (!snes_savestate_menu_is_open())
-        (void)snes_rewind_open();
-      break;
+    /* Both latch a flag for the main loop rather than acting here.
+     * snes_savestate_menu_poll_open() latches the word it is handed to edge
+     * detect against, so calling it from the key handler ate the edge the
+     * main loop's own call would have seen that frame. */
+    case kKeys_SaveStateMenu: g_savestate_menu_hotkey = 1; break;
+    case kKeys_Rewind:        g_rewind_hotkey = 1; break;
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;
       printf("New renderer = %x\n", g_ppu_render_flags & kPpuRenderFlags_NewRenderer);

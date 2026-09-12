@@ -6,7 +6,6 @@
 #include "util.h"
 #include "glsl_shader.h"
 #include "config.h"
-#include "zelda_overlay.h"
 
 #define CODE(...) #__VA_ARGS__
 
@@ -34,8 +33,6 @@ static void GL_APIENTRY MessageCallback(GLenum source,
   if (type == GL_DEBUG_TYPE_ERROR)
     Die("OpenGL error!\n");
 }
-
-static void OpenGLRenderer_DrawOverlay(const uint32_t *px, int w, int h);
 
 static bool OpenGLRenderer_Init(SDL_Window *window) {
   g_window = window;
@@ -140,8 +137,6 @@ static bool OpenGLRenderer_Init(SDL_Window *window) {
 
   if (g_config.shader)
     g_glsl_shader = GlslShader_CreateFromFile(g_config.shader);
-
-  g_zelda_overlay_draw = OpenGLRenderer_DrawOverlay;
   
   return true;
 }
@@ -166,48 +161,6 @@ static void OpenGLRenderer_BeginDraw(int width, int height, uint8 **pixels, int 
   g_draw_height = height;
   *pixels = g_screen_buffer;
   *pitch = width * 4;
-}
-
-/* The modal panel, drawn over the game quad at the same viewport rect.
- *
- * Reuses the game's shader program and VAO: that quad already covers exactly
- * the viewport the frame was scaled into, so binding a different texture and
- * drawing it again lands the panel on the same rect the SDL backend uses. Its
- * own texture object, because the game texture is re-uploaded every frame at
- * a different size. */
-static GLuint g_overlay_gl_texture;
-static int g_overlay_gl_w, g_overlay_gl_h;
-
-static void OpenGLRenderer_DrawOverlay(const uint32_t *px, int w, int h) {
-  if (!px || w <= 0 || h <= 0)
-    return;
-  if (!g_overlay_gl_texture) {
-    glGenTextures(1, &g_overlay_gl_texture);
-    if (!g_overlay_gl_texture)
-      return;
-    glBindTexture(GL_TEXTURE_2D, g_overlay_gl_texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    g_overlay_gl_w = g_overlay_gl_h = 0;
-  }
-  glBindTexture(GL_TEXTURE_2D, g_overlay_gl_texture);
-  if (w == g_overlay_gl_w && h == g_overlay_gl_h) {
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA,
-                    GL_UNSIGNED_INT_8_8_8_8_REV, px);
-  } else {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA,
-                 GL_UNSIGNED_INT_8_8_8_8_REV, px);
-    g_overlay_gl_w = w;
-    g_overlay_gl_h = h;
-  }
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  glUseProgram(g_program);
-  glBindVertexArray(g_VAO);
-  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-  glDisable(GL_BLEND);
 }
 
 static void OpenGLRenderer_EndDraw(void) {
@@ -250,11 +203,6 @@ static void OpenGLRenderer_EndDraw(void) {
   } else {
     GlslShader_Render(g_glsl_shader, &g_texture, viewport_x, viewport_y, viewport_width, viewport_height);
   }
-
-  /* After the shader path too: the panel is host chrome, not something a CRT
-   * preset should be filtering. */
-  glViewport(viewport_x, viewport_y, viewport_width, viewport_height);
-  ZeldaDrawHostPanels();
 
   SDL_GL_SwapWindow(g_window);
 }
