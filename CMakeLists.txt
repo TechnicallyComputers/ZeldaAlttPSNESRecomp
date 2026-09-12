@@ -130,15 +130,10 @@ if(WIN32)
     target_link_libraries(ZeldaALttPSNESRecomp PRIVATE ws2_32)
 endif()
 
-# Release-owned mod catalog staged next to the exe. mod_runtime resolves "mods"
-# against the anchored cwd (the exe dir on Windows, the .AppImage's folder on
-# Linux), so the catalog has to sit beside the binary rather than in the source
-# tree. Every feature stays disabled until the player enables it in Mods.
-set(ZELDA_PRELOADED_MODS "${CMAKE_CURRENT_SOURCE_DIR}/mods/preloaded")
-if(EXISTS "${ZELDA_PRELOADED_MODS}/packages")
-    add_custom_command(TARGET ZeldaALttPSNESRecomp POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${ZELDA_PRELOADED_MODS}"
-            "$<TARGET_FILE_DIR:ZeldaALttPSNESRecomp>/mods"
-        COMMENT "Preloading the A Link to the Past mod catalog")
-endif()
+# The mod catalog. The framework owns the staged layout
+# (mods/preloaded/packages beside the executable) and verifies it after
+# every build, so a rename touches snesrecomp/runner/runner.cmake and
+# nothing here. Pass NONE instead of a directory if this title ships
+# no catalog.
+snesrecomp_target_mod_catalog(ZeldaALttPSNESRecomp
+    "${CMAKE_SOURCE_DIR}/mods/preloaded")
