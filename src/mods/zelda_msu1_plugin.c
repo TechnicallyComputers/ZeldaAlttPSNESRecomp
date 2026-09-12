@@ -1,6 +1,5 @@
 #include "mod_runtime.h"
 #include "common_rtl.h"
-#include "config.h"
 #include "snes/msu1.h"
 
 #include <stdint.h>
@@ -125,14 +124,12 @@ static void zelda_msu1_reset(void) {
   g_zelda_msu1_active = 0;
   g_zelda_msu1_fading = 0;
   g_zelda_msu1_fade_volume = 0;
-  g_config.msu1_enabled = false;
 }
 
 static void zelda_msu1_activate(void) {
   g_zelda_msu1_active = 1;
   g_zelda_msu1_fading = 0;
   g_zelda_msu1_fade_volume = 0;
-  g_config.msu1_enabled = true;
   (void)snes_mod_register_frame_callback(zelda_msu1_tick);
   (void)snes_mod_register_apu_write_callback(zelda_msu1_apu_write);
 }
