@@ -137,7 +137,15 @@ target_include_directories(ZeldaALttPSNESRecomp PRIVATE
     ${RECOMP_UI_ROOT}/src)
 
 target_include_directories(ZeldaALttPSNESRecomp PRIVATE
-    ${CMAKE_SOURCE_DIR}
+    # NOT ${CMAKE_SOURCE_DIR}. The repo root holds VERSION, and on a
+    # case-insensitive filesystem (Windows, and macOS by default) an -I of the
+    # root makes libc++'s `#include <version>` read that file instead of the
+    # standard header -- the build then dies inside <cmath> on a line that says
+    # "0.1.0", with nothing in the message naming the include path. The only
+    # thing that needed the root was src/opengl.c's
+    # "third_party/gl_core/gl_core_3_1.h"; that include is now relative to the
+    # third_party directory named below.
+    ${CMAKE_SOURCE_DIR}/third_party
     # common_rtl.c includes "config.h": the desktop key-map / Config contract
     # a host is expected to supply. The framework's shared version is used
     # here; copy it into src/ and drop this line once this game needs its own.
